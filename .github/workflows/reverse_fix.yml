@@ -7,7 +7,7 @@ on:
 
 jobs:
 
-  if: github.repository == 'remnawave/frontend'
+  if: ${{ github.repository == 'Dreyk-Zer0/remna_frontend' }}
 
   build-and-release:
     name: Build and release
