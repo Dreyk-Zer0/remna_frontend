@@ -1,5 +1,7 @@
 name: Sync translations from Crowdin
 
+if: github.repository == 'remnawave/frontend'
+
 on:
   schedule:
     - cron: '0 * * * *'

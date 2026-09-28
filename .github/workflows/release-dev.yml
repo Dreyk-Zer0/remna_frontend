@@ -1,5 +1,7 @@
 name: Release frontend dev
 
+if: github.repository == 'remnawave/frontend'
+
 on:
   push:
     branches:

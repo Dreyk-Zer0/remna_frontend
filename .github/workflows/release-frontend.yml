@@ -1,5 +1,7 @@
 name: Release frontend
 
+if: github.repository == 'remnawave/frontend'
+
 on:
   push:
     tags:
