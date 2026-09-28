@@ -1,13 +1,14 @@
 name: Release frontend dev
 
-if: github.repository == 'Dreyk-Zer0/remna_frontend'
-
 on:
   push:
     branches:
       - reverse_fix
 
 jobs:
+
+  if: github.repository == 'remnawave/frontend'
+
   build-and-release:
     name: Build and release
     runs-on: ubuntu-24.04
