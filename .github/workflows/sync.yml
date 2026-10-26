@@ -1,0 +1,236 @@
+name: Sync upstream
+
+# Branch contract of this fork (see fork-upstream-maintenance design):
+#   main            byte-identical mirror of upstream main   -> never built
+#   reverse-fix     upstream main  + patch series            -> dev-build zip
+#   stable/<tag>    upstream tag   + the SAME patch series   -> <tag> release zip
+#
+# Patch series = every commit above the merge-base with upstream. Each of our
+# commits carries a "Fork-Patch: vN" trailer: version of our patch set AND the
+# audit anchor (any trailer-less commit above base means something leaked in).
+#
+# Single global gate: stable cuts run only when the dev pass is green in the
+# same run. A red dev pass (rebase conflict or build failure) freezes release
+# lines and their assets; the daily retry resumes automatically once green.
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_URL: https://github.com/remnawave/frontend.git
+  ZIP_NAME: remnawave-frontend.zip
+  DEV_RELEASE: dev-build
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync-dev:
+    name: Mirror upstream, rebase and verify dev line
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main
+          git fetch upstream --tags
+
+      - name: Restore rerere cache
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: rerere-cache
+          path: rerere-blob
+          merge-multiple: true
+
+      - name: Mirror upstream main and publish missing tags
+        run: |
+          set -euo pipefail
+          git push -f origin "refs/remotes/upstream/main:refs/heads/main"
+          for t in $(git tag --list '[0-9]*' --sort=-v:refname); do
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$t" >/dev/null 2>&1; then
+              echo "publishing missing upstream tag $t"
+              git push origin "refs/tags/$t:refs/tags/$t"
+            fi
+          done
+
+      - name: Rebase dev line onto upstream main
+        id: rebase
+        run: |
+          set -euo pipefail
+          git config rerere.enabled true
+          if [ -f rerere-blob/rr-cache.tar.gz ]; then
+            tar xzf rerere-blob/rr-cache.tar.gz -C .git/
+          fi
+          TIP=$(git rev-parse upstream/main)
+          # merge-base, not HEAD^: if a human ever stacks extra commits,
+          # HEAD^ would silently drop the patch from the replay range while
+          # merge-base replays everything and the audit below reports it.
+          BASE=$(git merge-base reverse-fix upstream/main)
+          audit_series() {
+            local range_base="$1" n
+            n=$(git rev-list --count "$range_base"..reverse-fix)
+            if [ "$n" -lt 1 ]; then
+              echo "AUDIT FAIL: no patch commits above upstream tip." >&2; exit 1
+            fi
+            if [ -n "$(git rev-list --merges "$range_base"..reverse-fix)" ]; then
+              echo "AUDIT FAIL: merge commits in patch line; rebase only, never merge." >&2; exit 1
+            fi
+            if [ "$(git log --format='%(trailers:key=Fork-Patch,valueonly=)' "$range_base"..reverse-fix | grep -c .)" -ne "$n" ]; then
+              echo "AUDIT FAIL: a commit above upstream tip lacks a Fork-Patch trailer (upstream leak or manual error)." >&2; exit 1
+            fi
+          }
+          if [ "$BASE" = "$TIP" ]; then
+            audit_series "$TIP"
+            echo "Upstream main unchanged since last green sync; nothing to do."
+            exit 0
+          fi
+          git rebase --onto "$TIP" "$BASE" reverse-fix
+          audit_series "$TIP"
+          echo "moved=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build dev zip
+        if: steps.rebase.outputs.moved == 'true'
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run start:build
+          zip -r "$ZIP_NAME" ./dist
+
+      - name: Publish dev-build asset, then move branch
+        if: steps.rebase.outputs.moved == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Asset first, branch pointer last: a failure never leaves the branch
+          # ahead of its artifacts.
+          gh release view "$DEV_RELEASE" >/dev/null 2>&1 || \
+            gh release create "$DEV_RELEASE" --title "$DEV_RELEASE (fork rolling)" \
+              --notes "Rolling dev build of the patched fork."
+          gh release upload "$DEV_RELEASE" "$ZIP_NAME" --clobber
+          git push --force-with-lease origin reverse-fix
+
+      - name: Save rerere cache
+        if: ${{ !cancelled() }}
+        run: |
+          (cd .git && tar czf ../rr-cache.tar.gz rr-cache) 2>/dev/null || true
+
+      - name: Upload rerere cache
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rerere-cache
+          path: rr-cache.tar.gz
+          if-no-files-found: ignore
+          retention-days: 30
+
+  sync-stable:
+    name: Cut stable/<tag> and publish its zip
+    needs: sync-dev
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream and fork refs
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --tags
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Restore rerere cache
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: rerere-cache
+          path: rerere-blob
+          merge-multiple: true
+
+      - name: Cherry-patch newest release tag and audit
+        id: cut
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config rerere.enabled true
+          if [ -f rerere-blob/rr-cache.tar.gz ]; then
+            tar xzf rerere-blob/rr-cache.tar.gz -C .git/
+          fi
+          LATEST=$(git ls-remote --tags upstream 'refs/tags/[0-9]*' \
+            | sed 's#.*refs/tags/##' | grep -v '\^{}' | sort -V | tail -n1)
+          if [ -z "$LATEST" ]; then
+            echo "No numeric upstream tags found." >&2; exit 1
+          fi
+          # Done marker: BOTH the release line branch and its release exist.
+          # If either half is missing (or a stale branch predates the current
+          # patched commit), re-cut deterministically from tag + current patch.
+          if git ls-remote --exit-code --heads origin "refs/heads/stable/$LATEST" >/dev/null 2>&1 \
+             && gh release view "$LATEST" >/dev/null 2>&1; then
+            echo "stable/$LATEST and its release both exist; nothing to cut."
+            exit 0
+          fi
+          PATCH_BASE=$(git merge-base origin/reverse-fix upstream/main)
+          git checkout -B "stable/$LATEST" "refs/tags/$LATEST"
+          git cherry-pick "$PATCH_BASE..origin/reverse-fix"
+          N=$(git rev-list --count "refs/tags/$LATEST"..HEAD)
+          S=$(git rev-list --count "$PATCH_BASE..origin/reverse-fix")
+          if [ "$N" -ne "$S" ]; then
+            echo "AUDIT FAIL: cherry-pick produced $N commits, series has $S." >&2; exit 1
+          fi
+          if [ "$(git log --format='%(trailers:key=Fork-Patch,valueonly=)' "refs/tags/$LATEST"..HEAD | grep -c .)" -ne "$N" ]; then
+            echo "AUDIT FAIL: cherry-picked series lost Fork-Patch trailers." >&2; exit 1
+          fi
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: Build stable zip
+        if: steps.cut.outputs.tag != ''
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run start:build
+          zip -r "$ZIP_NAME" ./dist
+
+      - name: Publish release asset, then push branch
+        if: steps.cut.outputs.tag != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.cut.outputs.tag }}'
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG (patched fork)" \
+              --notes "Frontend $TAG from upstream tag + the fork patch commit. Built by sync.yml."
+          gh release upload "$TAG" "$ZIP_NAME" --clobber
+          git push --force-with-lease "origin" "HEAD:refs/heads/stable/$TAG"
+
+      - name: Save rerere cache
+        if: ${{ !cancelled() }}
+        run: |
+          (cd .git && tar czf ../rr-cache.tar.gz rr-cache) 2>/dev/null || true
+
+      - name: Upload rerere cache
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rerere-cache
+          path: rr-cache.tar.gz
+          if-no-files-found: ignore
+          retention-days: 30
