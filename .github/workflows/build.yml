@@ -1,0 +1,68 @@
+name: Rebuild branch artifact
+
+# Catches HUMAN pushes to patched branches (GITHUB_TOKEN pushes never fire
+# push events, so automation from sync.yml does not loop here). Rebuilds the
+# zip for that branch and replaces the asset of its release:
+#   reverse-fix    -> dev-build release
+#   stable/x.y.z   -> x.y.z release
+
+on:
+  push:
+    branches:
+      - reverse-fix
+      - 'stable/**'
+
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to rebuild (reverse-fix or stable/<tag>)
+        required: true
+        default: reverse-fix
+
+permissions:
+  contents: write
+
+env:
+  ZIP_NAME: remnawave-frontend.zip
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  rebuild:
+    name: Build ${{ inputs.branch || github.ref_name }}
+    runs-on: ubuntu-24.04
+    env:
+      TARGET_BRANCH: ${{ inputs.branch || github.ref_name }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v7
+
+      - name: Resolve target release
+        id: rel
+        run: |
+          set -euo pipefail
+          if [ "$TARGET_BRANCH" = "reverse-fix" ]; then
+            echo "release=dev-build" >> "$GITHUB_OUTPUT"
+          elif [[ "$TARGET_BRANCH" == stable/* ]]; then
+            echo "release=${TARGET_BRANCH#stable/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported branch: $TARGET_BRANCH" >&2
+            exit 1
+          fi
+
+      - name: Build and zip
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run start:build
+          zip -r "$ZIP_NAME" ./dist
+
+      - name: Publish asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RELEASE='${{ steps.rel.outputs.release }}'
+          gh release view "$RELEASE" >/dev/null 2>&1 || \
+            gh release create "$RELEASE" --title "$RELEASE (patched fork)" \
+              --notes "Built by build.yml from $TARGET_BRANCH."
+          gh release upload "$RELEASE" "$ZIP_NAME" --clobber
